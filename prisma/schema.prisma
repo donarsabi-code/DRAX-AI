@@ -1,0 +1,190 @@
+// Schéma de données — DRAX AI Chat
+// Adapté de l'architecture demandée (profiles / conversations / messages / attachments)
+// + tables système : Session (sessions serveur), champs sécurité (resetTokenHash),
+//   ApiEvent (journal du flux complet de l'application), préférence de modèle IA.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Utilisateurs ────────────────────────────────────────────────────────────
+// Équivalent de la table "profiles" demandée + hachage de mot de passe.
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  // Null pour les comptes créés via Google / Apple / code e-mail (aucun mot de passe local)
+  passwordHash     String?
+  displayName      String
+  avatarUrl        String?
+  // Bio courte affichée dans le Dashboard (paramètres → profil)
+  bio              String?
+  // Guide d'installation de l'app (PWA) déjà fermé par l'utilisateur ?
+  installGuideDismissed Boolean @default(false)
+  // Réinitialisation de mot de passe : on stocke le HACHAGE du token (jamais le token lui-même)
+  resetTokenHash   String?
+  resetTokenExpiry DateTime?
+  // Avatar stocké en base (déploiements sans disque persistant, ex. Vercel).
+  // Base64 ≤ 600 Ko ; prioritaire sur le fichier disque si présent.
+  avatarData       String?
+  // Extension de l'avatar en base : "png" | "jpg" | "webp"
+  avatarExt        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  // Modèle IA choisi par l'utilisateur pour ses nouvelles conversations
+  // ("fast" | "reasoning" — voir src/lib/ai-provider.ts)
+  aiModel   String   @default("fast")
+
+  sessions      Session[]
+  conversations Conversation[]
+  messages      Message[]
+  attachments   Attachment[]
+  oauthAccounts OauthAccount[]
+  apiEvents     ApiEvent[]
+}
+
+// ─── Comptes OAuth externes (Google, Apple) ─────────────────────────────────
+// Un utilisateur peut lier plusieurs fournisseurs ; le couple
+// (provider, providerAccountId) est unique et sert de clé de résolution.
+model OauthAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          String // "google" | "apple"
+  providerAccountId String // "sub" émis par le fournisseur
+  email             String? // e-mail renvoyé par le fournisseur (peut être un relais privé Apple)
+  createdAt         DateTime @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+// ─── Codes à usage unique envoyés par e-mail (connexion / inscription) ───────
+// Seul le HACHAGE du code est stocké. TTL court, tentative max, usage unique.
+model EmailOtpCode {
+  id        String    @id @default(cuid())
+  email     String
+  codeHash  String
+  purpose   String // "auth" (connexion OU inscription selon l'existence du compte)
+  expiresAt DateTime
+  usedAt    DateTime?
+  attempts  Int       @default(0)
+  createdAt DateTime  @default(now())
+
+  @@index([email, createdAt])
+}
+
+// ─── Sessions d'authentification ─────────────────────────────────────────────
+// Session opaque : le cookie ne contient que le token brut, la BDD stocke son hachage.
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ─── Conversations ───────────────────────────────────────────────────────────
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String   @default("Nouvelle conversation")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages    Message[]
+  attachments Attachment[]
+
+  @@index([userId, updatedAt])
+}
+
+// ─── Messages ────────────────────────────────────────────────────────────────
+// role : "user" | "assistant"  (les prompts système ne sont jamais persistés)
+// status : "completed" | "cancelled" | "error"
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role           String
+  content        String
+  model          String?
+  status         String       @default("completed")
+  errorType      String?
+  // Sources web utilisées (JSON : [{url, name, snippet, host_name}]) — null sinon
+  sources        String?
+  // Identifiant généré par le client : déduplication en cas de nouvelle tentative réseau
+  clientRef      String?
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([userId])
+  @@unique([conversationId, clientRef])
+}
+
+// ─── Pièces jointes ──────────────────────────────────────────────────────────
+model Attachment {
+  id             String        @id @default(cuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversationId String?
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  storagePath    String
+  fileName       String
+  mimeType       String
+  sizeBytes      Int
+  // Image stockée en base (déploiements sans disque persistant, ex. Vercel).
+  // Base64 ; prioritaire sur storagePath si présent.
+  dataBase64     String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([conversationId])
+}
+
+// ─── Configuration serveur (clé/valeur) ─────────────────────────────────────
+// Stocke les identifiants des fournisseurs (Google OAuth, Apple, SMTP e-mail)
+// renseignés depuis l'interface (Paramètres → Serveur) par le propriétaire du
+// serveur (premier compte créé). Priorité de lecture : BDD > variables d'env.
+// Les secrets ne sont jamais renvoyés au client (réponses masquées).
+model ServerSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Journal du flux applicatif (ApiEvent) ─────────────────────────────────
+// Chaque action significative de l'API est journalisée côté serveur :
+// inscription, connexion, OTP, chat, génération d'image, conversations,
+// recherche. Les métadonnées (modèle utilisé, tailles, durées…) sont
+// stockées en JSON sérialisé. Consultable par l'utilisateur lui-même via
+// GET /api/system/events (aucune donnée d'un autre utilisateur n'est lisible).
+model ApiEvent {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  route      String   // ex. "/api/chat", "/api/auth/register"
+  action     String   // ex. "chat.stream", "auth.register", "image.generate"
+  method     String   // "GET" | "POST" | "PATCH" | "DELETE"
+  status     Int      // code HTTP final
+  durationMs Int      // durée de traitement côté serveur
+  // JSON libre : { model?, conversationId?, imageGenerated?, errorType?… }
+  meta       String?
+
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([route, createdAt])
+}
